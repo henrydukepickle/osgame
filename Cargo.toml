@@ -11,8 +11,8 @@ panic = "abort"
 
 [dependencies]
 bootloader = "0.9"
+embedded-graphics = "0.8.2"
 uefi = "0.36.1"
-uefi-raw = "0.13.0"
 
 [build]
 target = "x86_64-unknown-uefi"

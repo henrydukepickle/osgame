@@ -1,81 +1,134 @@
 #![no_std]
 #![no_main]
 
-use uefi::Status;
-use uefi_raw::protocol::console::InputKey;
+mod memalloc;
+mod screen;
+mod strutils;
+mod ui;
 
+use core::slice;
+
+use embedded_graphics::{
+    Drawable,
+    mono_font::{MonoTextStyle, ascii::FONT_6X10},
+    pixelcolor::{Bgr888, Rgb888},
+    prelude::{Dimensions, Point, RgbColor, Size},
+    primitives::Rectangle,
+    text::{Text, TextStyle},
+};
+use uefi::{
+    CStr16, Handle, Status,
+    boot::{
+        EventType, ScopedProtocol, Tpl, create_event, exit_boot_services, get_handle_for_protocol,
+        open_protocol_exclusive, stall,
+    },
+    entry,
+    proto::console::gop::{FrameBuffer, GraphicsOutput, Mode, PixelFormat},
+    system::with_stdout,
+    table::system_table_raw,
+};
+
+use crate::{
+    memalloc::{MemAllocator, malloc},
+    ui::GameState,
+};
+
+macro_rules! write_to_console {
+    ($string:expr) => {
+        let mut buf: [u16; 64] = [0; 64];
+        with_stdout(|out| {
+            out.output_string(CStr16::from_str_with_buf($string, buf.as_mut_slice()).unwrap())
+        })
+        .unwrap();
+    };
+    ($string:expr, $buf_size:literal) => {
+        let mut buf: [u16; $buf_size] = [0; $buf_size];
+        with_stdout(|out| {
+            out.output_string(CStr16::from_str_with_buf($string, buf.as_mut_slice()).unwrap())
+        })
+        .unwrap();
+    };
+}
 #[panic_handler]
-fn panic<'a>(_info: &core::panic::PanicInfo<'a>) -> ! {
+fn panic<'a>(info: &core::panic::PanicInfo<'a>) -> ! {
+    write_to_console!("panic!");
+    write_to_console!(info.message().as_str().unwrap(), 600);
     loop {}
 }
 
-#[unsafe(export_name = "efi_main")]
-extern "efiapi" fn uefi_main(
-    image_handle: ::uefi::Handle,
-    system_table_raw: *const ::core::ffi::c_void,
-) -> uefi::prelude::Status {
-    unsafe {
-        ::uefi::boot::set_image_handle(image_handle);
-        ::uefi::table::set_system_table(system_table_raw.cast());
+#[entry]
+fn main() -> Status {
+    write_to_console!("Starting..");
+    write_to_console!("Allocator Created..");
+    let gop_handle = get_handle_for_protocol::<GraphicsOutput>().unwrap();
+    write_to_console!("GOP Handle Found..");
+    let gop_result: Result<ScopedProtocol<GraphicsOutput>, uefi::Error> =
+        open_protocol_exclusive(gop_handle);
+    if let Err(ref e) = gop_result {
+        match e.status() {
+            Status::UNSUPPORTED => {
+                write_to_console!("Unsupported.");
+            }
+            Status::ACCESS_DENIED => {
+                write_to_console!("Access Denied.");
+            }
+            _ => {}
+        }
     }
-
-    let table: *mut uefi_raw::table::system::SystemTable = system_table_raw
-        .cast::<uefi_raw::table::system::SystemTable>()
-        .cast_mut();
-    let stdout = unsafe { (*table).stdout };
-    let stdin = unsafe { (*table).stdin };
-    let mut num = 0;
-    let mut correct_key = InputKey {
-        scan_code: 16,
-        unicode_char: b'Q' as u16,
+    let mut gop = gop_result.unwrap();
+    write_to_console!("GOP Accessed..");
+    let best_mode = get_best_mode(&gop).unwrap();
+    gop.set_mode(&best_mode).unwrap();
+    let mut fb = gop.frame_buffer();
+    let ptr = fb.as_mut_ptr();
+    let mut screen = screen::Screen {
+        _buffer: fb,
+        ptr: ptr as *mut Bgr888,
+        size: best_mode.info().resolution(),
+        stride: best_mode.info().stride(),
     };
-    let mut guys = 0;
-    let mut guycost = 10;
-    let mut n = 0;
-    loop {
-        if unsafe {
-            ((*stdin).read_key_stroke)(stdin, (&mut correct_key) as *mut InputKey)
-                == Status::SUCCESS
-        } && num >= guycost
-        {
-            num -= guycost;
-            guys += 1;
-            guycost = guycost + (guycost / 10)
-        }
-        if n == 0 {
-            let _ = unsafe { ((*stdout).clear_screen)(stdout) };
-            let _ = unsafe { ((*stdout).output_string)(stdout, get_num_string(num).as_ptr()) };
-            let _ = unsafe { ((*stdout).output_string)(stdout, get_num_string(guys).as_ptr()) };
-            let _ = unsafe { ((*stdout).output_string)(stdout, get_num_string(guycost).as_ptr()) };
-        }
-        for _ in 0..10_000 {
-            let _ = 2 + 2;
-        }
-        n = (n + 1) % 100;
-        num += 1 + guys;
-    }
+    let mut game = GameState::new(screen);
+    game.run_game()
 }
 
-fn get_num_string(num: u64) -> [u16; 64] {
-    let mut ret = [0; 64];
+const WIDTH: usize = 1920;
+const HEIGHT: usize = 1080;
+
+fn get_best_mode(gop: &ScopedProtocol<GraphicsOutput>) -> Option<Mode> {
+    let mut best = (0, 0);
+    let mut curr_mode = None;
+    for mode in gop.modes() {
+        if mode.info().pixel_format() == PixelFormat::Bgr
+            && mode.info().resolution().0 <= WIDTH
+            && mode.info().resolution().1 <= HEIGHT
+            && mode.info().resolution().0 > best.0
+        {
+            best = mode.info().resolution();
+            curr_mode = Some(mode)
+        }
+    }
+    curr_mode
+}
+
+fn get_num_string(num: u64) -> &'static str {
     if num == 0 {
-        ret[0] = b'0' as u16;
-        ret[1] = b'\n' as u16;
-        return ret;
+        let ret = malloc(1);
+        ret[0] = b'0';
+        return str::from_utf8(ret).unwrap();
     }
     let mut running = num;
-    let mut ind = max_ten_pow(num) as usize;
-    ret[ind] = b'\n' as u16;
-    ind -= 1;
+    let length = max_ten_pow(num) as usize;
+    let mut ind = length - 1;
+    let ret = malloc(length);
     loop {
-        ret[ind] = ((running % 10) as u16) + (b'0' as u16);
+        ret[ind] = ((running % 10) as u8) + b'0';
         running /= 10;
         if ind == 0 {
             break;
         }
         ind -= 1;
     }
-    ret
+    str::from_utf8(ret).unwrap()
 }
 //max power of ten strictly less
 //number of digits in num
